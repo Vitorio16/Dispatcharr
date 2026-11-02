@@ -105,6 +105,12 @@ class StreamManager:
         # Add tracking for tried streams and current stream
         self.current_stream_id = stream_id
         self.tried_stream_ids = set()
+        self.current_profile_id = None
+        self.tried_combinations = set()
+        self.failed_combinations = {}
+        self.hot_standby = None
+        self._hot_ts_probe = bytearray()
+        self._hot_ts_compatible = False
 
         # Full-list exhaustion wraps (capped by MAX_STREAM_SWITCHES).
         self._failover_rotation_passes = 0
@@ -170,6 +176,63 @@ class StreamManager:
         self._last_bitrate_db_save_time = 0
         self._bitrate_db_save_interval = 30  # seconds between DB writes
         self._bitrate_warmup_samples = 10   # discard first N samples while EMA stabilizes (~5s)
+
+    def _observe_hot_standby_input(self, chunk):
+        """Enable the optional path only after observing real TS framing."""
+        if not ConfigHelper.get('HOT_STANDBY_ENABLED', False) or self.transcode:
+            return
+        if getattr(self, '_hot_ts_compatible', False):
+            self._start_hot_standby()
+            return
+        from .standby import StandbyHTTPReader
+        probe = getattr(self, '_hot_ts_probe', bytearray())
+        probe.extend(chunk)
+        for offset in range(max(0, len(probe) - 3 * TS_PACKET_SIZE + 1)):
+            if all(StandbyHTTPReader._valid_header(probe, offset + n * TS_PACKET_SIZE)
+                   for n in range(3)):
+                self._hot_ts_compatible = True
+                break
+        self._hot_ts_probe = probe[-(3 * TS_PACKET_SIZE - 1):]
+        if getattr(self, '_hot_ts_compatible', False):
+            self._start_hot_standby()
+
+    def _start_hot_standby(self):
+        if (not ConfigHelper.get('HOT_STANDBY_ENABLED', False)
+                or getattr(self, 'hot_standby', None) is not None
+                or not getattr(self, '_hot_ts_compatible', False)
+                or not self.worker_id or not self.current_stream_id
+                or not getattr(self.buffer, 'redis_client', None)):
+            return
+        from gevent.monkey import is_module_patched
+        from .standby import supported_http_ts
+        if not is_module_patched('socket') or not supported_http_ts(self.url, self.transcode):
+            return
+        if time.monotonic() < getattr(self, '_hot_start_after', 0):
+            return
+        self._hot_start_after = time.monotonic() + ConfigHelper.get('HOT_STANDBY_SEARCH_INTERVAL', 5)
+        try:
+            from .hot_standby import HotStandby
+            controller = HotStandby(self)
+            if self.current_profile_id is None:
+                return
+            self.hot_standby = controller
+            controller.start()
+        except Exception as exc:
+            logger.warning('Hot standby unavailable channel=%s (%s)',
+                           self.channel_id, type(exc).__name__)
+
+    def _promote_hot_standby(self):
+        controller = getattr(self, 'hot_standby', None)
+        return bool(controller and controller.promote())
+
+    def _cleanup_hot_standby(self):
+        controller = getattr(self, 'hot_standby', None)
+        if controller:
+            try:
+                controller.close()
+            except Exception as exc:
+                logger.warning('Hot standby cleanup deferred channel=%s (%s)',
+                               self.channel_id, type(exc).__name__)
 
     def _create_session(self):
         """Create and configure requests session with optimal settings"""
@@ -700,6 +763,7 @@ class StreamManager:
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
         finally:
+            self._cleanup_hot_standby()
             try:
                 from ..server import ProxyServer
                 ProxyServer.get_instance()._live_stream_managers.pop(self.channel_id, None)
@@ -1348,6 +1412,9 @@ class StreamManager:
 
     def _establish_http_connection(self):
         """Establish HTTP connection using thread-based reader (same as transcode path)"""
+        if (self.connected and self.socket and getattr(self, 'http_reader', None)
+                and getattr(self.http_reader, 'active', False)):
+            return True  # A hot promotion already attached the open source.
         try:
             logger.debug(f"Using HTTP streamer thread to connect to stream: {self.url}")
 
@@ -1434,8 +1501,10 @@ class StreamManager:
         try:
             # Both transcode and HTTP now use the same subprocess/socket approach
             # This gives us perfect control: check flags between chunks, timeout just returns False
-            while (self.running and self.connected and not self.stop_requested
-                   and not self.needs_stream_switch and not self.needs_reconnect):
+            while self.running and not self.stop_requested:
+                if not self.connected or self.needs_stream_switch or self.needs_reconnect:
+                    if not self._promote_hot_standby():
+                        break
                 if self.fetch_chunk():
                     self.last_data_time = time.time()
                     if self._connection_is_awaiting_data():
@@ -1500,6 +1569,7 @@ class StreamManager:
 
         # Set the flag first
         self.stop_requested = True
+        self._cleanup_hot_standby()
 
         # Close any active response connection
         if hasattr(self, 'current_response') and self.current_response:  # CORRECT NAME
@@ -1536,6 +1606,24 @@ class StreamManager:
                 logger.debug(f"Error flushing final bitrate to DB for channel {self.channel_id}: {e}")
 
     def update_url(self, new_url, stream_id=None, m3u_profile_id=None, reason=None,
+                   previous_stream_name=None, previous_provider_name=None):
+        if new_url == self.url:
+            return False
+        self._hot_ts_compatible = False
+        self._hot_ts_probe = bytearray()
+        controller = getattr(self, 'hot_standby', None)
+        if controller:
+            with controller.lock:
+                self._cleanup_hot_standby()
+                self.hot_standby = None
+                self._hot_ts_compatible = False
+                self._hot_ts_probe = bytearray()
+                return self._update_url(new_url, stream_id, m3u_profile_id, reason,
+                                        previous_stream_name, previous_provider_name)
+        return self._update_url(new_url, stream_id, m3u_profile_id, reason,
+                                previous_stream_name, previous_provider_name)
+
+    def _update_url(self, new_url, stream_id=None, m3u_profile_id=None, reason=None,
                    previous_stream_name=None, previous_provider_name=None):
         """Update stream URL and reconnect with proper cleanup for both HTTP and transcode sessions.
 
@@ -1610,6 +1698,8 @@ class StreamManager:
             # Update URL and reset connection state
             old_url = self.url
             self.url = new_url
+            if m3u_profile_id is not None:
+                self.current_profile_id = m3u_profile_id
             self.connected = False
             # A new URL is a new place to try, so the short startup clock applies again.
             self._startup_failover_exhausted = False
@@ -1785,6 +1875,13 @@ class StreamManager:
                     self._request_startup_stream_switch(now)
                     consecutive_unhealthy_checks = 0
                 elif inactivity_duration > timeout_threshold and self.connected:
+                    controller = getattr(self, 'hot_standby', None)
+                    if controller and controller.ready:
+                        # The manager performs the handoff; the monitor only
+                        # signals it, avoiding concurrent buffer writers.
+                        self.needs_reconnect = True
+                        gevent.sleep(self._health_poll_interval(now))
+                        continue
                     if self.healthy:
                         logger.warning(f"Stream unhealthy for channel {self.channel_id} - no data for {inactivity_duration:.1f}s")
                         self.healthy = False
@@ -1832,6 +1929,8 @@ class StreamManager:
 
     def _attempt_reconnect(self):
         """Attempt to reconnect to the current stream"""
+        if self._promote_hot_standby():
+            return True
         try:
             logger.info(f"Attempting reconnect to current stream for channel {self.channel_id}")
 
@@ -2097,6 +2196,7 @@ class StreamManager:
 
             # Track chunk size before adding to buffer
             chunk_size = len(chunk)
+            self._observe_hot_standby_input(chunk)
             self._update_bytes_processed(chunk_size)
 
             # Add directly to buffer without TS-specific processing
@@ -2243,6 +2343,18 @@ class StreamManager:
         """
         if previous_stream_info is None:
             previous_stream_info = {}
+        controller = getattr(self, 'hot_standby', None)
+        if controller and not controller.closed:
+            try:
+                if controller.promote() or controller.cold_switch():
+                    return True
+            except Exception as exc:
+                logger.warning('Profile failover unavailable channel=%s (%s)',
+                               self.channel_id, type(exc).__name__)
+                if not self.running:
+                    return False
+            # Unsupported transports retain the legacy FFmpeg switch path.
+            # Exhausted HTTP pairs remain excluded below during their cooldown.
         try:
             logger.info(f"Trying to find alternative stream for channel {self.channel_id}, current stream ID: {self.current_stream_id}")
 
@@ -2254,6 +2366,10 @@ class StreamManager:
 
             # Filter out streams we've already tried
             untried_streams = [s for s in alternate_streams if s['stream_id'] not in self.tried_stream_ids]
+            if controller:
+                untried_streams = [s for s in untried_streams
+                                   if self.failed_combinations.get((s['stream_id'], s['profile_id']), 0)
+                                   <= time.monotonic()]
             if untried_streams:
                 ids_to_try = ', '.join([str(s['stream_id']) for s in untried_streams])
                 logger.info(f"Found {len(untried_streams)} untried streams for channel {self.channel_id}: [{ids_to_try}]")
@@ -2329,7 +2445,10 @@ class StreamManager:
 
                 # Get stream info including URL using the profile_id we already have
                 logger.info(f"Trying next stream ID {stream_id} with profile ID {profile_id} for channel {self.channel_id}")
-                stream_info = get_stream_info_for_switch(self.channel_id, stream_id)
+                if controller:
+                    stream_info = get_stream_info_for_switch(self.channel_id, stream_id, profile_id)
+                else:
+                    stream_info = get_stream_info_for_switch(self.channel_id, stream_id)
 
                 if 'error' in stream_info or not stream_info.get('url'):
                     logger.error(f"Error getting info for stream {stream_id} for channel {self.channel_id}: {stream_info.get('error', 'No URL')}")

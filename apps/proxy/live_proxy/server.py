@@ -1913,6 +1913,17 @@ class ProxyServer:
                         self._execute_redis_command(
                             lambda: self.redis_client.setex(worker_heartbeat_key, 30, str(time.time()))
                         )
+                        if time.monotonic() >= getattr(self, '_standby_recovery_at', 0):
+                            from .standby_reservation import recover_stale_standbys
+                            managers = list(self._live_stream_managers.values()) + list(self.stream_managers.values())
+                            local_tokens = set()
+                            for manager in managers:
+                                standby = getattr(manager, 'hot_standby', None)
+                                if standby and not standby.closed and standby.candidate:
+                                    local_tokens.add(standby.candidate.token)
+                            recover_stale_standbys(self.redis_client, local_worker_id=self.worker_id,
+                                                  local_tokens=local_tokens)
+                            self._standby_recovery_at = time.monotonic() + 60
 
                     # Refresh channel registry
                     self.refresh_channel_registry()
@@ -2446,6 +2457,12 @@ class ProxyServer:
         Prefer Channel/Stream ORM helpers while rows exist; fall back to
         metadata-only release when the channel was deleted mid-playback.
         """
+        if self.redis_client:
+            from .standby_reservation import release_standby
+            # Also works after a channel row is deleted or its worker dies.
+            # The ledger lives outside live:channel:* so failed releases remain
+            # recoverable instead of being erased by the subsequent key scan.
+            release_standby(self.redis_client, channel_id)
         try:
             from .url_utils import release_worker_stream
 

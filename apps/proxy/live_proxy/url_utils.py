@@ -698,6 +698,41 @@ def get_alternate_streams(
     finally:
         close_old_connections()
 
+def get_profile_failover_candidates(channel_id, current_stream_id, current_profile_id):
+    """All eligible stream/profile pairs, current provider first; no reservations.
+
+    Unlike get_alternate_streams, this retains every active profile and includes
+    the current stream. Pool capacity is authoritative again when reserving.
+    """
+    from core.utils import RedisClient
+    try:
+        channel = get_stream_object(channel_id)
+        if not isinstance(channel, Channel):
+            return []  # Preview workers retain their existing lifecycle.
+        redis = RedisClient.get_client()
+        if not redis:
+            return []
+        streams = list(channel.streams.select_related('m3u_account').order_by('channelstream__order'))
+        ids = [stream.id for stream in streams]
+        if current_stream_id in ids:
+            index = ids.index(current_stream_id)
+            streams = streams[index:] + streams[:index]
+        result = []
+        for stream in streams:
+            account = stream.m3u_account
+            if not account or not account.is_active:
+                continue
+            profiles = account.profiles.filter(is_active=True).order_by('-is_default', 'id')
+            for profile in profiles:
+                if (stream.id, profile.id) == (current_stream_id, current_profile_id):
+                    continue
+                if pool_has_capacity_for_profile(profile, redis):
+                    result.append(dict(stream_id=stream.id, profile_id=profile.id))
+        return result
+    finally:
+        close_old_connections()
+
+
 def validate_stream_url(url, user_agent=None, timeout=(5, 5)):
     """
     Validate if a stream URL is accessible without downloading the full content.

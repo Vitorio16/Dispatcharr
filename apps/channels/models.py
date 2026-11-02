@@ -1102,6 +1102,8 @@ class Channel(models.Model):
                   no stream/profile info could be found for cleanup.
         """
         redis_client = RedisClient.get_client()
+        from apps.proxy.live_proxy.standby_reservation import release_standby
+        release_standby(redis_client, str(self.uuid))
         metadata_key = RedisKeys.channel_metadata(str(self.uuid))
 
         stream_id = redis_getdel(redis_client, f"channel_stream:{self.id}")

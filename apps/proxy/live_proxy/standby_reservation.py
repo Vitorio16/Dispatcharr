@@ -77,7 +77,7 @@ def release_standby(redis, channel_id, token=None, *, stale_for_worker=None, onl
                                 commit=lambda pipe: pipe.delete(key))
 
 
-def recover_stale_standbys(redis):
+def recover_stale_standbys(redis, *, local_worker_id=None, local_tokens=()):
     """Heartbeat-based janitor for ledgers orphaned by hard worker termination.
 
     Invoked by the existing proxy cleanup loop, even when the feature is off.
@@ -87,7 +87,17 @@ def recover_stale_standbys(redis):
     for key in redis.scan_iter(match='channel_standby:*', count=100):
         channel_id = _text(key).split(':', 1)[1]
         try:
-            release_standby(redis, channel_id, only_if_dead=True)
+            raw = _text(redis.get(key))
+            if not raw:
+                continue
+            record = json.loads(raw)
+            if (record['worker'] == local_worker_id and raw not in local_tokens
+                    and time.time() - record['created_at'] >= 60):
+                # A failed local cleanup (e.g. manual switch during a Redis
+                # outage) must not wait for an otherwise healthy worker to die.
+                release_standby(redis, channel_id, raw)
+            else:
+                release_standby(redis, channel_id, only_if_dead=True)
         except (ValueError, TypeError, KeyError):
             # Preserve an invalid ledger for investigation; do not let one bad
             # record prevent the existing worker cleanup loop doing its work.

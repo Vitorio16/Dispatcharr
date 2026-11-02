@@ -8,6 +8,7 @@ from django.test import SimpleTestCase
 from apps.channels.models import Channel
 from apps.proxy.live_proxy.url_utils import get_profile_failover_candidates
 from apps.proxy.live_proxy.input.manager import StreamManager
+from apps.proxy.live_proxy.constants import UpstreamState
 from apps.proxy.live_proxy.tests.test_health_reconnect import _make_manager
 from apps.proxy.live_proxy.tests import test_hot_standby as lifecycle
 from apps.proxy.live_proxy.tests.test_hot_standby import profile, PACKET
@@ -114,6 +115,7 @@ class ManagerStandbyIntegrationTests(SimpleTestCase):
         manager = _make_manager()
         manager.socket = Mock()
         manager.http_reader = SimpleNamespace(active=True)
+        manager.upstream_state = UpstreamState.HOT_PROMOTED
         with patch('apps.proxy.live_proxy.input.http_streamer.HTTPStreamReader') as reader:
             self.assertTrue(manager._establish_http_connection())
         reader.assert_not_called()

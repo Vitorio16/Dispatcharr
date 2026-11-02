@@ -14,7 +14,7 @@ from core.utils import log_system_event
 from .buffer import StreamBuffer
 from ..utils import detect_stream_type, get_logger, signal_process_tree
 from ..redis_keys import RedisKeys
-from ..constants import ChannelState, EventType, StreamType, ChannelMetadataField, TS_PACKET_SIZE
+from ..constants import ChannelState, EventType, StreamType, ChannelMetadataField, TS_PACKET_SIZE, UpstreamState
 from ..config_helper import ConfigHelper
 from ..url_utils import get_alternate_streams, get_stream_info_for_switch, get_stream_object
 from ..utils import resolve_channel_display_name
@@ -55,6 +55,7 @@ class StreamManager:
         self.buffer = buffer
         self.running = True
         self.connected = False
+        self.upstream_state = UpstreamState.CONNECTION_REQUIRED
         self.retry_count = 0
         self.max_retries = ConfigHelper.max_retries()
         self._retry_window_seconds = ConfigHelper.retry_window_seconds()
@@ -222,8 +223,15 @@ class StreamManager:
                            self.channel_id, type(exc).__name__)
 
     def _promote_hot_standby(self):
+        """Return switch success; upstream_state records whether input attached."""
         controller = getattr(self, 'hot_standby', None)
         return bool(controller and controller.promote())
+
+    def _upstream_is_attached(self):
+        """Recovery success alone does not imply an established readable source."""
+        return (getattr(self, 'upstream_state', UpstreamState.CONNECTION_REQUIRED)
+                in (UpstreamState.CONNECTED, UpstreamState.HOT_PROMOTED)
+                and self.connected and getattr(self, 'socket', None) is not None)
 
     def _cleanup_hot_standby(self):
         controller = getattr(self, 'hot_standby', None)
@@ -612,12 +620,19 @@ class StreamManager:
                     # Handle connection based on whether we transcode or not
                     connection_result = False
                     try:
-                        if self.transcode:
+                        if self._upstream_is_attached():
+                            # Outer reconnect/switch recovery may already have
+                            # attached a hot source (or opened a conventional
+                            # reconnect). Resume it without calling an opener.
+                            connection_result = True
+                        elif self.transcode:
                             connection_result = self._establish_transcode_connection()
                         else:
                             connection_result = self._establish_http_connection()
 
                         if connection_result:
+                            if getattr(self, 'upstream_state', None) is not UpstreamState.HOT_PROMOTED:
+                                self.upstream_state = UpstreamState.CONNECTED
                             # Store connection start time to measure success duration
                             connection_start_time = time.time()
                             self._had_successful_connection = True
@@ -660,6 +675,10 @@ class StreamManager:
                             return
 
                         if self.needs_reconnect:
+                            # The spare can become ready just after the data
+                            # loop's promotion attempt. Keep that source too.
+                            if self._promote_hot_standby():
+                                continue
                             # Health monitor asked for a same-URL reconnect. Clear the
                             # flag and tear the old socket down so the next establish
                             # does not orphan the reader thread, then fall through to
@@ -1412,8 +1431,7 @@ class StreamManager:
 
     def _establish_http_connection(self):
         """Establish HTTP connection using thread-based reader (same as transcode path)"""
-        if (self.connected and self.socket and getattr(self, 'http_reader', None)
-                and getattr(self.http_reader, 'active', False)):
+        if self._upstream_is_attached():
             return True  # A hot promotion already attached the open source.
         try:
             logger.debug(f"Using HTTP streamer thread to connect to stream: {self.url}")
@@ -1521,9 +1539,11 @@ class StreamManager:
 
         # If we exit the loop, connection is closed or failed
         self.connected = False
+        self.upstream_state = UpstreamState.CONNECTION_REQUIRED
 
     def _close_all_connections(self):
         """Close all connection resources"""
+        self.upstream_state = UpstreamState.CONNECTION_REQUIRED
         if self.socket or self.transcode_process:
             try:
                 self._close_socket()
@@ -1702,6 +1722,7 @@ class StreamManager:
                 self.current_profile_id = m3u_profile_id
             self.connected = False
             # A new URL is a new place to try, so the short startup clock applies again.
+            self.upstream_state = UpstreamState.CONNECTION_REQUIRED
             self._startup_failover_exhausted = False
 
             # Reset bitrate EMA on every URL change so stale data never carries over
@@ -1928,7 +1949,7 @@ class StreamManager:
             gevent.sleep(self._health_poll_interval(time.time()))
 
     def _attempt_reconnect(self):
-        """Attempt to reconnect to the current stream"""
+        """Recover input; upstream_state distinguishes hot handoff from reconnect."""
         if self._promote_hot_standby():
             return True
         try:
@@ -1969,6 +1990,7 @@ class StreamManager:
                     connection_result = self._establish_http_connection()
 
                 if connection_result:
+                    self.upstream_state = UpstreamState.CONNECTED
                     self.connection_start_time = time.time()
                     logger.info(f"Reconnect successful for channel {self.channel_id}")
 
@@ -2005,6 +2027,7 @@ class StreamManager:
 
     def _close_connection(self):
         """Close HTTP connection resources"""
+        self.upstream_state = UpstreamState.CONNECTION_REQUIRED
         # Close response if it exists
         if hasattr(self, 'current_response') and self.current_response:
             try:
@@ -2023,6 +2046,7 @@ class StreamManager:
 
     def _close_socket(self):
         """Close socket and transcode resources as needed"""
+        self.upstream_state = UpstreamState.CONNECTION_REQUIRED
         # First try to use _close_connection for HTTP resources
         if self.current_response or self.current_session:
             self._close_connection()
@@ -2346,7 +2370,9 @@ class StreamManager:
         controller = getattr(self, 'hot_standby', None)
         if controller and not controller.closed:
             try:
-                if controller.promote() or controller.cold_switch():
+                if self._promote_hot_standby():
+                    return True
+                if controller.cold_switch():
                     return True
             except Exception as exc:
                 logger.warning('Profile failover unavailable channel=%s (%s)',

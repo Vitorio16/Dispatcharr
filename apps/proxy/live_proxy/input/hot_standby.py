@@ -12,7 +12,7 @@ from gevent.lock import RLock
 from django.db import close_old_connections
 
 from ..config_helper import ConfigHelper
-from ..constants import ChannelMetadataField as Field
+from ..constants import ChannelMetadataField as Field, UpstreamState
 from ..redis_keys import RedisKeys
 from ..standby_reservation import reserve_standby, release_standby, promote_standby
 from ..utils import get_logger
@@ -270,11 +270,14 @@ class HotStandby:
         manager.connection_start_time = manager.last_data_time = time.time()
         manager._connection_awaiting_data = not hot
         manager.healthy = True
+        manager.upstream_state = UpstreamState.CONNECTION_REQUIRED
+        manager.connected = False
         if hot:
             try:
                 manager.socket = candidate.reader.promote()
                 manager.http_reader = candidate.reader
                 manager.connected = True
+                manager.upstream_state = UpstreamState.HOT_PROMOTED
             except Exception:
                 candidate.reader.stop()
                 manager.connected = False
@@ -292,6 +295,11 @@ class HotStandby:
         return True
 
     def promote(self):
+        """Transfer the assignment; manager.upstream_state records fd attachment.
+
+        A committed handoff whose fd attachment failed requires conventional
+        establishment. Success here must never be used to infer socket state.
+        """
         with self.lock:
             candidate = self.candidate
             if (self.closed or self.manager.stop_requested or not candidate
@@ -310,7 +318,7 @@ class HotStandby:
             return False
 
     def cold_switch(self):
-        """Same ordering/accounting when no spare has finished warming."""
+        """Select/transfer a URL, leaving upstream_state CONNECTION_REQUIRED."""
         with self.lock:
             if self.closed or self.manager.stop_requested:
                 return False

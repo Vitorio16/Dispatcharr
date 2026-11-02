@@ -37,6 +37,14 @@ the manager. Its requests response is preserved: promotion makes no second
 upstream GET. Only the manager writes to StreamBuffer. A replacement spare is
 prepared on the next maintenance pass (normally within 250 ms).
 
+The manager's explicit upstream state distinguishes `HOT_PROMOTED` (existing
+spare attached), `CONNECTED` (ordinary connection/reconnect established), and
+`CONNECTION_REQUIRED` (cold switch, failed attachment or disconnected input).
+The run loop resumes an attached source directly, including when the spare only
+became ready after the inner data loop exited. Recovery methods retain their
+boolean success contract; callers do not use that boolean to infer whether a
+new connection is needed. A cold switch still goes through normal establishment.
+
 If no spare is ready, normal retries continue. The supported path's eventual
 cold switch considers stream/profile pairs in the same order. Unsupported
 transports can still use the legacy FFmpeg failover path. Failed pairs enter a

@@ -3,6 +3,15 @@ Constants used throughout the TS Proxy application.
 Centralizing constants makes it easier to maintain and modify them.
 """
 
+from enum import Enum, auto
+
+
+class UpstreamState(Enum):
+    """Whether recovery supplied a readable input or only selected a URL."""
+    CONNECTION_REQUIRED = auto()
+    CONNECTED = auto()
+    HOT_PROMOTED = auto()
+
 # Redis related constants
 REDIS_KEY_PREFIX = "live"
 REDIS_TTL_DEFAULT = 3600  # 1 hour

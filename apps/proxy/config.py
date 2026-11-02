@@ -1,5 +1,6 @@
 """Shared configuration between proxy types"""
 import time
+import os
 from django.db import connection
 
 class BaseConfig:
@@ -96,6 +97,12 @@ class HLSConfig(BaseConfig):
 
 class TSConfig(BaseConfig):
     """Configuration settings for TS proxy"""
+
+    HOT_STANDBY_ENABLED = os.environ.get('HOT_STANDBY_ENABLED', 'false').lower() == 'true'
+    HOT_STANDBY_WARMUP_TIMEOUT = max(1.0, float(os.environ.get('HOT_STANDBY_WARMUP_TIMEOUT', '10')))
+    HOT_STANDBY_COOLDOWN = max(1.0, float(os.environ.get('HOT_STANDBY_COOLDOWN', '60')))
+    HOT_STANDBY_IDLE_TIMEOUT = max(1.0, float(os.environ.get('HOT_STANDBY_IDLE_TIMEOUT', '10')))
+    HOT_STANDBY_SEARCH_INTERVAL = max(0.25, float(os.environ.get('HOT_STANDBY_SEARCH_INTERVAL', '5')))
 
     # Buffer settings
     INITIAL_BEHIND_CHUNKS = 4  # How many chunks behind to start a client (4 chunks = ~1MB)

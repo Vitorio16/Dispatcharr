@@ -319,7 +319,8 @@ def _remember_credential_release_key(
 
 
 def _release_credential_slot_by_profile_id(
-    profile_id: int, redis_client, *, release_profile: bool = False
+    profile_id: int, redis_client, *, release_profile: bool = False,
+    guard=None, commit=None,
 ) -> bool:
     """
     Release one credential slot for the profile, and its profile slot if requested.
@@ -337,6 +338,8 @@ def _release_credential_slot_by_profile_id(
     for _ in range(RELEASE_MAX_ATTEMPTS):
         with redis_client.pipeline() as pipe:
             try:
+                if guard is not None and not guard(pipe):
+                    return False
                 pipe.watch(release_key, profile_key)
                 profile_count = int(pipe.get(profile_key) or 0)
                 cred_key = pipe.get(release_key)
@@ -355,6 +358,8 @@ def _release_credential_slot_by_profile_id(
                     pipe.delete(release_key)
                 if release_profile and profile_count > 0:
                     pipe.decr(profile_key)
+                if commit is not None:
+                    commit(pipe)
                 pipe.execute()
                 return True
             except WatchError:
@@ -389,32 +394,37 @@ def _reserve_server_group_slot_for_profile(
 
 
 def reserve_profile_slot(
-    profile, redis_client
+    profile, redis_client, *, guard=None, commit=None
 ) -> Tuple[bool, int, Optional[ReserveFailureReason]]:
     """
     Atomically reserve profile + optional credential slots (INCR-first).
 
     Returns (reserved, profile_count_after_attempt, failure_reason).
     failure_reason is set when reserved is False.
-    """
-    profile_key = profile_connections_key(profile.id)
-    profile_count = 0
 
-    if profile.max_streams > 0:
-        profile_count = redis_client.incr(profile_key)
-        if profile_count > profile.max_streams:
-            redis_client.decr(profile_key)
-            return False, profile_count - 1, "profile_full"
+    Optional guard/commit callbacks join a caller's ownership token to the
+    counter transaction. guard WATCHes and reads state before MULTI; commit
+    queues only writes. Both must be supplied together.
+    """
+    if guard is not None:
+        return _reserve_guarded_profile_slot(profile, redis_client, guard, commit)
+
+    profile_key = profile_connections_key(profile.id)
+    # Unlimited is a capacity policy, not an exemption from accounting. Every
+    # real connection needs a count so later handoffs/releases remain balanced.
+    profile_count = redis_client.incr(profile_key)
+    if profile.max_streams > 0 and profile_count > profile.max_streams:
+        redis_client.decr(profile_key)
+        return False, profile_count - 1, "profile_full"
 
     cred_reserved, cred_key = _reserve_server_group_slot_for_profile(
         profile, redis_client
     )
     if not cred_reserved:
-        if profile.max_streams > 0:
-            redis_client.decr(profile_key)
+        redis_client.decr(profile_key)
         return (
             False,
-            profile_count - 1 if profile.max_streams > 0 else 0,
+            profile_count - 1,
             "credential_full",
         )
 
@@ -424,12 +434,52 @@ def reserve_profile_slot(
     return True, profile_count, None
 
 
-def release_profile_slot(profile_id: int, redis_client) -> bool:
+def _reserve_guarded_profile_slot(profile, redis_client, guard, commit):
+    """Reserve counters and a caller's ownership record in the same transaction.
+
+    guard runs before MULTI and must WATCH all state it reads. commit only queues
+    writes. This is also used by the live standby ledger; counters remain owned
+    by this module. A worker crash cannot separate a slot from its release token.
+    """
+    profile_key = profile_connections_key(profile.id)
+    group = get_enforced_server_group_for_profile(profile)
+    cred_key = _held_credential_slot_key(profile)
+    if group and profile.max_streams > 0 and not cred_key:
+        return False, 0, "credential_full"
+    for _ in range(RELEASE_MAX_ATTEMPTS):
+        with redis_client.pipeline() as pipe:
+            try:
+                if not guard(pipe):
+                    return False, 0, "profile_full"
+                pipe.watch(profile_key)
+                count = int(pipe.get(profile_key) or 0)
+                if profile.max_streams > 0 and count >= profile.max_streams:
+                    return False, count, "profile_full"
+                if cred_key:
+                    pipe.watch(cred_key)
+                    if int(pipe.get(cred_key) or 0) >= profile.max_streams:
+                        return False, count, "credential_full"
+                pipe.multi()
+                pipe.incr(profile_key)
+                if cred_key:
+                    pipe.incr(cred_key)
+                    pipe.set(profile_credential_release_key(profile.id), cred_key)
+                commit(pipe)
+                pipe.execute()
+                return True, count + 1, None
+            except WatchError:
+                continue
+    return False, 0, "profile_full"
+
+
+def release_profile_slot(profile_id: int, redis_client, *, guard=None, commit=None) -> bool:
     """Release profile and shared credential slots after a stream end.
 
     Returns True when the Redis update committed, False when concurrent
     updates exhausted the retry budget and the release was abandoned.
+    guard/commit optionally consume or transfer an ownership token in the same
+    existing WATCH transaction as the decrements (see reserve_profile_slot).
     """
     return _release_credential_slot_by_profile_id(
-        profile_id, redis_client, release_profile=True
+        profile_id, redis_client, release_profile=True, guard=guard, commit=commit
     )

@@ -5,6 +5,19 @@ Centralizing these key patterns makes it easier to maintain and change them if n
 
 class RedisKeys:
     @staticmethod
+    def channel_standby(channel_id):
+        """Persistent reservation token; never expire without releasing counters."""
+        return f"channel_standby:{channel_id}"
+
+    @staticmethod
+    def channel_stream(channel_pk):
+        return f"channel_stream:{channel_pk}"
+
+    @staticmethod
+    def stream_profile(stream_id):
+        return f"stream_profile:{stream_id}"
+
+    @staticmethod
     def channel_metadata(channel_id):
         """Key for channel metadata hash"""
         return f"live:channel:{channel_id}:metadata"

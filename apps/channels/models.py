@@ -1179,12 +1179,13 @@ class Channel(models.Model):
             log_label=f"Channel {self.uuid}",
         )
 
-    def update_stream_profile(self, new_profile_id):
+    def update_stream_profile(self, new_profile_id, new_stream_id=None):
         """
-        Updates the profile for the current stream and adjusts connection counts.
+        Move this channel's active assignment, transferring its existing slot.
 
         Args:
             new_profile_id: The ID of the new stream profile to use
+            new_stream_id: Destination stream ID, or the current stream when omitted
 
         Returns:
             bool: True if successful, False otherwise
@@ -1198,6 +1199,8 @@ class Channel(models.Model):
             return False
 
         stream_id = int(stream_id_bytes)
+        target_stream_id = int(new_stream_id) if new_stream_id is not None else stream_id
+        new_profile_id = int(new_profile_id)
 
         # Get current profile ID
         current_profile_id_bytes = redis_client.get(f"stream_profile:{stream_id}")
@@ -1207,45 +1210,55 @@ class Channel(models.Model):
 
         current_profile_id = int(current_profile_id_bytes)
 
-        # Don't do anything if the profile is already set to the requested one
-        if current_profile_id == new_profile_id:
-            return True
-
         from apps.m3u.connection_pool import (
             move_credential_slot_on_profile_switch,
             profile_connections_key,
         )
         from apps.m3u.models import M3UAccountProfile
 
-        old_profile = M3UAccountProfile.objects.select_related(
-            "m3u_account__server_group"
-        ).get(id=current_profile_id)
-        new_profile = M3UAccountProfile.objects.select_related(
-            "m3u_account__server_group"
-        ).get(id=new_profile_id)
+        profile_changed = current_profile_id != new_profile_id
+        if profile_changed:
+            old_profile = M3UAccountProfile.objects.select_related(
+                "m3u_account__server_group"
+            ).get(id=current_profile_id)
+            new_profile = M3UAccountProfile.objects.select_related(
+                "m3u_account__server_group"
+            ).get(id=new_profile_id)
 
-        if not move_credential_slot_on_profile_switch(
-            old_profile, new_profile, redis_client
-        ):
-            logger.warning(
-                "Shared login pool full for profile %s during stream profile switch",
-                new_profile_id,
-            )
-            return False
+            if not move_credential_slot_on_profile_switch(
+                old_profile, new_profile, redis_client
+            ):
+                logger.warning(
+                    "Shared login pool full for profile %s during stream profile switch",
+                    new_profile_id,
+                )
+                return False
 
-        # Profile counters always move on switch; credential totals move only when login changes.
+        # Transfer one existing slot only when the profile changes. A different
+        # stream using the same profile keeps both counters unchanged.
         old_profile_connections_key = profile_connections_key(current_profile_id)
         new_profile_connections_key = profile_connections_key(new_profile_id)
         old_count = int(redis_client.get(old_profile_connections_key) or 0)
 
         pipe = redis_client.pipeline()
-        if old_count > 0:
-            pipe.decr(old_profile_connections_key)
-        pipe.set(f"stream_profile:{stream_id}", new_profile_id)
-        pipe.incr(new_profile_connections_key)
+        if profile_changed:
+            if old_count > 0:
+                pipe.decr(old_profile_connections_key)
+            pipe.incr(new_profile_connections_key)
+        # Stream and profile are one assignment. Never write the destination
+        # profile onto the outgoing stream or reserve it again in the manager.
+        if target_stream_id != stream_id:
+            pipe.delete(RedisKeys.stream_profile(stream_id))
+        pipe.set(RedisKeys.channel_stream(self.id), target_stream_id)
+        pipe.set(RedisKeys.stream_profile(target_stream_id), new_profile_id)
+        pipe.hset(RedisKeys.channel_metadata(str(self.uuid)), mapping={
+            ChannelMetadataField.STREAM_ID: str(target_stream_id),
+            ChannelMetadataField.M3U_PROFILE: str(new_profile_id),
+        })
         pipe.execute()
         logger.info(
-            f"Updated stream {stream_id} profile from {current_profile_id} to {new_profile_id}"
+            f"Updated channel {self.uuid} assignment from stream {stream_id} "
+            f"profile {current_profile_id} to stream {target_stream_id} profile {new_profile_id}"
         )
         return True
 

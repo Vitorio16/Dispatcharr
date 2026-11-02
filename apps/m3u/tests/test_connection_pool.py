@@ -126,6 +126,10 @@ class FakeRedisPipeline:
         self._ops.append(("set", key, value))
         return self
 
+    def hset(self, key, mapping):
+        self._ops.append(("hset", key, mapping))
+        return self
+
     def execute(self):
         if any(self.redis.get(key) != value for key, value in self._watched.items()):
             raise WatchError()
@@ -138,6 +142,8 @@ class FakeRedisPipeline:
                 self.redis.set(op[1], op[2])
             elif op[0] == "delete":
                 self.redis.delete(op[1])
+            elif op[0] == "hset":
+                self.redis.hset(op[1], mapping=op[2])
         self._ops = []
 
 

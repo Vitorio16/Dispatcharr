@@ -1675,25 +1675,22 @@ class StreamManager:
         from apps.channels.models import Stream, Channel
         from django.db import connection
 
-        # Update stream profile if we're switching streams
-        if self.current_stream_id and stream_id and self.current_stream_id != stream_id:
+        # Transfer the active assignment to the actual destination stream, also
+        # allowing a profile change on the same stream. This helper owns counts.
+        if self.current_stream_id and m3u_profile_id is not None:
             try:
                 # Get the channel by UUID
                 channel = Channel.objects.get(uuid=self.channel_id)
 
-                # Get stream to find its profile
-                #new_stream = Stream.objects.get(pk=stream_id)
-
-                # Use the new method to update the profile and manage connection counts
-                if m3u_profile_id:
-                    success = channel.update_stream_profile(m3u_profile_id)
-                    if success:
-                        logger.debug(f"Updated m3u profile for channel {self.channel_id} to use profile from stream {stream_id}")
-                    else:
-                        logger.warning(f"Failed to update stream profile for channel {self.channel_id}")
+                success = channel.update_stream_profile(
+                    m3u_profile_id, new_stream_id=stream_id or self.current_stream_id)
+                if not success:
+                    logger.warning(f"Failed to update stream profile for channel {self.channel_id}")
+                    return False
 
             except Exception as e:
                 logger.error(f"Error updating stream profile for channel {self.channel_id}: {e}")
+                return False
 
             finally:
                 # Always close database connection after profile update
@@ -2471,10 +2468,7 @@ class StreamManager:
 
                 # Get stream info including URL using the profile_id we already have
                 logger.info(f"Trying next stream ID {stream_id} with profile ID {profile_id} for channel {self.channel_id}")
-                if controller:
-                    stream_info = get_stream_info_for_switch(self.channel_id, stream_id, profile_id)
-                else:
-                    stream_info = get_stream_info_for_switch(self.channel_id, stream_id)
+                stream_info = get_stream_info_for_switch(self.channel_id, stream_id, profile_id)
 
                 if 'error' in stream_info or not stream_info.get('url'):
                     logger.error(f"Error getting info for stream {stream_id} for channel {self.channel_id}: {stream_info.get('error', 'No URL')}")

@@ -18,6 +18,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Test entrypoint environment propagation
+        run: bash docker/tests/test-entrypoint-env.sh
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
